@@ -1,0 +1,304 @@
+name: Create Release from Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Name of the release branch to create artifacts from'
+        required: true
+        type: string
+      release_tag:
+        description: 'Release tag name (defaults to branch name if not provided)'
+        required: false
+        type: string
+      protect_branch:
+        description: 'Lock/write-protect the branch after release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout repository (full history for tag creation)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch_name }}
+          fetch-depth: 0  # Fetch all history for complete git repository
+
+      - name: Validate branch checkout
+        run: |
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          EXPECTED_BRANCH="${{ github.event.inputs.branch_name }}"
+          # Handle both local branch names and remote branch names
+          if [[ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]] && [[ "$CURRENT_BRANCH" != "HEAD" ]]; then
+            echo "Warning: Checked out branch '$CURRENT_BRANCH' does not match expected '$EXPECTED_BRANCH'"
+          fi
+          # Verify we have a valid git repository
+          if ! git rev-parse --verify HEAD > /dev/null 2>&1; then
+            echo "Error: Invalid git repository or branch"
+            exit 1
+          fi
+          echo "Successfully checked out branch/commit for release"
+
+      - name: Set release tag
+        id: set_tag
+        run: |
+          if [ -z "${{ github.event.inputs.release_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.branch_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create tag on release branch and push
+        id: tag_commit
+        run: |
+          TAG_NAME="${{ steps.set_tag.outputs.tag }}"
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          RELEASE_COMMIT=$(git rev-parse HEAD)
+
+          # Create tag on current HEAD of release branch
+          git tag -f "$TAG_NAME" HEAD
+          echo "commit=$RELEASE_COMMIT" >> $GITHUB_OUTPUT
+          echo "Created tag '$TAG_NAME' on release branch HEAD: $RELEASE_COMMIT"
+
+          # Push tag to remote (on the release branch)
+          git push origin "$TAG_NAME" || echo "Tag may already exist on remote"
+          echo "Tag '$TAG_NAME' pushed to remote (points to release branch '$BRANCH_NAME' commit: $RELEASE_COMMIT)"
+
+      - name: Create clean standalone repository with only release branch
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          TAG_NAME="${{ steps.set_tag.outputs.tag }}"
+          CLEAN_REPO_DIR="$RUNNER_TEMP/clean-repo"
+
+          # Get the commit SHA of the release branch HEAD
+          RELEASE_COMMIT=$(git rev-parse HEAD)
+          echo "Release branch HEAD: $RELEASE_COMMIT"
+
+          # Create a completely fresh repository with only the release branch
+          mkdir -p "$CLEAN_REPO_DIR"
+          cd "$CLEAN_REPO_DIR"
+
+          # Initialize new bare repository
+          git init --bare repo.git
+          cd repo.git
+
+          # Add the original repo as a remote temporarily
+          git remote add source "$GITHUB_WORKSPACE"
+
+          # Fetch only the release branch with full history
+          git fetch source "$BRANCH_NAME:$BRANCH_NAME" --depth=2147483647
+
+          # Fetch the tag we just created
+          git fetch source "$TAG_NAME:$TAG_NAME" 2>/dev/null || true
+
+          # Remove the temporary remote
+          git remote remove source
+
+          # Clone the bare repo to a working directory
+          cd ..
+          git clone repo.git repo
+          cd repo
+          git checkout "$BRANCH_NAME"
+
+          # Remove all remotes
+          git remote remove origin 2>/dev/null || true
+
+          # Remove all branches except the target branch
+          git branch | sed 's/^[* ] //' | grep -v "^$BRANCH_NAME$" | while read branch; do
+            git branch -D "$branch" 2>/dev/null || true
+          done
+
+          # Remove all remote refs
+          rm -rf .git/refs/remotes
+
+          # Clean up packed-refs to remove all remotes and other branches
+          if [ -f .git/packed-refs ]; then
+            grep -v "refs/remotes/" .git/packed-refs | \
+            awk -v branch="$BRANCH_NAME" -v tag="$TAG_NAME" '
+              /^#/ { print; next }
+              /refs\/tags\/'"$tag"'$/ { print; next }
+              /refs\/heads\/'"$branch"'$/ { print; next }
+              /refs\/heads\// { next }
+              { print }
+            ' > .git/packed-refs.tmp 2>/dev/null && \
+            mv .git/packed-refs.tmp .git/packed-refs || rm -f .git/packed-refs.tmp
+          fi
+
+          # Remove all other branch refs
+          find .git/refs/heads -type f ! -name "$BRANCH_NAME" -delete 2>/dev/null || true
+
+          # Clean up config
+          git config --remove-section remote.origin 2>/dev/null || true
+
+          # Remove reflog entries that might reference other branches
+          rm -rf .git/logs/refs/remotes
+          find .git/logs/refs/heads -type f ! -name "$BRANCH_NAME" -delete 2>/dev/null || true
+
+          # Copy the cleaned repository back to workspace
+          cd "$GITHUB_WORKSPACE"
+          rm -rf .git
+          cp -a "$CLEAN_REPO_DIR/repo/.git" .git
+          git checkout -B "$BRANCH_NAME" HEAD
+          git reset --hard HEAD
+
+          # Clean up temp directory
+          rm -rf "$CLEAN_REPO_DIR"
+
+          # Verify we have a clean standalone repository
+          echo "Repository cleaned:"
+          echo "  Current branch: $(git branch --show-current)"
+          echo "  Local branches: $(git branch | wc -l)"
+          echo "  Remotes: $(git remote | wc -l || echo 0)"
+          echo "  HEAD commit: $(git rev-parse HEAD)"
+
+      - name: Create repository archive (tar.gz)
+        run: |
+          ARCHIVE_NAME="repository-${{ steps.set_tag.outputs.tag }}.tar.gz"
+          TEMP_DIR="$RUNNER_TEMP/repo-archive-tar"
+          ARCHIVE_PATH="$GITHUB_WORKSPACE/$ARCHIVE_NAME"
+
+          # Copy repository to temp directory to avoid "file changed as we read it" errors
+          mkdir -p "$TEMP_DIR"
+          cp -a . "$TEMP_DIR/repo"
+
+          # Create complete git repository archive including .git directory
+          # Exclude archive files, workflow files, and source artifacts that reference main
+          cd "$TEMP_DIR/repo"
+          tar -czf "$ARCHIVE_PATH" \
+            --exclude='.github/workflows' \
+            --exclude='*.tar.gz' \
+            --exclude='*.zip' \
+            --exclude='.git/logs/refs/remotes' \
+            --exclude='.git/refs/remotes' \
+            .
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$TEMP_DIR"
+
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: Create repository archive (zip)
+        run: |
+          ARCHIVE_NAME="repository-${{ steps.set_tag.outputs.tag }}.zip"
+          TEMP_DIR="$RUNNER_TEMP/repo-archive-zip"
+          ARCHIVE_PATH="$GITHUB_WORKSPACE/$ARCHIVE_NAME"
+
+          # Copy repository to temp directory to avoid "file changed as we read it" errors
+          mkdir -p "$TEMP_DIR"
+          cp -a . "$TEMP_DIR/repo"
+
+          # Create complete git repository archive including .git directory
+          # Exclude archive files, workflow files, and source artifacts that reference main
+          cd "$TEMP_DIR/repo"
+          zip -r "$ARCHIVE_PATH" . \
+            -x ".github/workflows/*" \
+            -x "*.tar.gz" \
+            -x "*.zip" \
+            -x ".git/logs/refs/remotes/*" \
+            -x ".git/refs/remotes/*"
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$TEMP_DIR"
+
+          echo "ZIP_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set_tag.outputs.tag }}
+          target_commitish: ${{ steps.tag_commit.outputs.commit }}
+          name: Release ${{ steps.set_tag.outputs.tag }}
+          body: |
+            Release artifacts for branch `${{ github.event.inputs.branch_name }}`
+
+            This release contains the complete git repository as tar.gz and zip archives.
+          files: |
+            repository-${{ steps.set_tag.outputs.tag }}.tar.gz
+            repository-${{ steps.set_tag.outputs.tag }}.zip
+          draft: false
+          prerelease: false
+
+      - name: Protect/Lock branch
+        if: ${{ github.event.inputs.protect_branch == 'true' }}
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+
+          # Check if branch exists on remote
+          echo "Checking if branch '$BRANCH_NAME' exists on remote..."
+          BRANCH_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/branches/$BRANCH_NAME")
+
+          HTTP_CODE=$(echo "$BRANCH_RESPONSE" | tail -n1)
+          BRANCH_BODY=$(echo "$BRANCH_RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Error: Branch '$BRANCH_NAME' does not exist on remote (HTTP $HTTP_CODE)"
+            echo "Response: $BRANCH_BODY"
+            echo "Please push the branch first before protecting it."
+            exit 1
+          fi
+
+          echo "✓ Branch '$BRANCH_NAME' exists on remote"
+
+          # Check if PAT token is available
+          if [ -z "${{ secrets.CODEBASE_RELEASER_TOKEN }}" ]; then
+            echo "⚠ Warning: CODEBASE_RELEASER_TOKEN secret not found"
+            echo "Branch protection requires a PAT with admin access."
+            echo "Please add CODEBASE_RELEASER_TOKEN as a repository secret."
+            echo "Continuing without branch protection..."
+            exit 0
+          fi
+
+          # Create or update branch protection rule using PAT
+          echo "Setting up branch protection for '$BRANCH_NAME' using PAT..."
+          PROTECTION_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+            -H "Authorization: token ${{ secrets.CODEBASE_RELEASER_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/branches/$BRANCH_NAME/protection" \
+            -d '{
+              "required_status_checks": null,
+              "enforce_admins": true,
+              "required_pull_request_reviews": null,
+              "restrictions": null,
+              "allow_force_pushes": false,
+              "allow_deletions": false,
+              "lock_branch": true
+            }')
+
+          PROTECTION_HTTP_CODE=$(echo "$PROTECTION_RESPONSE" | tail -n1)
+          PROTECTION_BODY=$(echo "$PROTECTION_RESPONSE" | head -n-1)
+
+          if [ "$PROTECTION_HTTP_CODE" = "200" ]; then
+            echo "✓ Branch '$BRANCH_NAME' has been protected and locked"
+          elif [ "$PROTECTION_HTTP_CODE" = "204" ]; then
+            echo "✓ Branch '$BRANCH_NAME' protection updated (no content returned)"
+          elif [ "$PROTECTION_HTTP_CODE" = "403" ]; then
+            echo "⚠ Warning: Permission denied (HTTP 403) - Branch protection not set"
+            echo "The CODEBASE_RELEASER_TOKEN may not have the required scopes or the user may not have admin access."
+            echo "Ensure the PAT has 'repo' and 'admin:repo_hook' scopes and the user has admin permissions on the repository."
+            echo "Response: $PROTECTION_BODY"
+            echo "Continuing without branch protection..."
+            exit 0
+          elif [ "$PROTECTION_HTTP_CODE" = "404" ]; then
+            echo "⚠ Warning: Branch protection API not found (HTTP 404) - Branch protection not set"
+            echo "This may indicate the repository doesn't support branch protection or the API endpoint is incorrect."
+            echo "Response: $PROTECTION_BODY"
+            echo "Continuing without branch protection..."
+            exit 0
+          else
+            echo "⚠ Warning: Failed to protect branch (HTTP $PROTECTION_HTTP_CODE) - Branch protection not set"
+            echo "Response: $PROTECTION_BODY"
+            echo "Continuing without branch protection..."
+            exit 0
+          fi
