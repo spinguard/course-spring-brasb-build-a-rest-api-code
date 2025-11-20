@@ -31,10 +31,26 @@ fi
 echo "Root commit: $ROOT_COMMIT"
 
 # Get all commits from main branch (excluding the root commit itself)
-COMMITS=$(git rev-list --reverse "$ROOT_COMMIT".."$MAIN_BRANCH")
+ALL_COMMITS=$(git rev-list --reverse "$ROOT_COMMIT".."$MAIN_BRANCH")
 
-if [ -z "$COMMITS" ]; then
+if [ -z "$ALL_COMMITS" ]; then
     echo "Warning: No commits found after root commit"
+    COMMITS=""
+else
+    # Check if the last commit has message "add releaser workflow"
+    LAST_COMMIT=$(echo "$ALL_COMMITS" | tail -1)
+    if [ -n "$LAST_COMMIT" ]; then
+        LAST_COMMIT_MSG=$(git log -1 --format="%s" "$LAST_COMMIT")
+        if [ "$LAST_COMMIT_MSG" = "add releaser workflow" ]; then
+            echo "Excluding last commit '$LAST_COMMIT' with message 'add releaser workflow'"
+            # Remove the last commit from the list
+            COMMITS=$(echo "$ALL_COMMITS" | head -n -1)
+        else
+            COMMITS="$ALL_COMMITS"
+        fi
+    else
+        COMMITS="$ALL_COMMITS"
+    fi
 fi
 
 # Create orphaned branch from root commit
